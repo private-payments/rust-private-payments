@@ -291,6 +291,13 @@ pub struct PaymentCode {
     address_types: HashSet<AddressType>,
 }
 
+impl PaymentCode {
+    /// Returns address types supported by this code.
+    pub fn address_types(&self) -> &HashSet<AddressType> {
+        &self.address_types
+    }
+}
+
 impl std::fmt::Display for PaymentCode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let hrp = network_to_hrp(&self.network);
