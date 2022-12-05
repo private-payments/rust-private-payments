@@ -49,7 +49,7 @@ impl AddressType {
 /// A struct that a sender of funds uses in combination with a recipient's `PaymentCode` in order
 /// to send notifications and calculate payment addresses. This is invariant with regard to
 /// recipient and needs to be constructed only once per account (unique per BIP32 seed + account).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sender(bip32::ExtendedPrivKey);
 
 impl Sender {
@@ -61,15 +61,30 @@ impl Sender {
         account: u32,
     ) -> Result<Self, Error> {
         let master = bip32::ExtendedPrivKey::new_master(network, seed)?;
-        let path: bip32::DerivationPath = vec![
-            PURPOSE,
-            bip32::ChildNumber::Hardened { index: 0 },
-            bip32::ChildNumber::Hardened { index: account },
-        ]
-        .into();
-        let n = master.derive_priv(secp, &path)?;
 
-        Ok(Self(n))
+        Self::from_master_xprv(secp, master, account)
+    }
+
+    /// Construct a sender side from a master extended private key. Not supplying a master key here
+    /// produces an error.
+    pub fn from_master_xprv<C: secp256k1::Signing>(
+        secp: &Secp256k1<C>,
+        master: bip32::ExtendedPrivKey,
+        account: u32,
+    ) -> Result<Self, Error> {
+        if master.depth == 0 && master.parent_fingerprint == bip32::Fingerprint::default() {
+            let path: bip32::DerivationPath = vec![
+                PURPOSE,
+                bip32::ChildNumber::Hardened { index: 0 },
+                bip32::ChildNumber::Hardened { index: account },
+            ]
+            .into();
+            let n = master.derive_priv(secp, &path)?;
+
+            Ok(Self(n))
+        } else {
+            Err(Error::NotMasterKey)
+        }
     }
 
     /// Construct a notification for a payment code. The txout is an `OP_RETURN` consuming 0 sats.
@@ -164,7 +179,7 @@ pub struct SenderCommitment {
 
 /// A struct that a recipient uses to generate a payment code and process notifications. This is
 /// invariant with regard to sender and needs to be constructed only once (unique per BIP32 seed).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(non_snake_case)]
 pub struct Recipient {
     /// The private key *p* associated with a recipient (payment code).
@@ -187,20 +202,36 @@ impl Recipient {
         address_types: HashSet<AddressType>,
     ) -> Result<Self, Error> {
         let master = bip32::ExtendedPrivKey::new_master(network, seed)?;
-        let path: bip32::DerivationPath = vec![
-            PURPOSE,
-            bip32::ChildNumber::Hardened { index: 0 },
-            bip32::ChildNumber::Hardened { index: account },
-        ]
-        .into();
-        let p = master.derive_priv(secp, &path)?.to_priv();
 
-        Ok(Self {
-            p,
-            P: PublicKey::from_private_key(secp, &p),
-            network,
-            address_types,
-        })
+        Self::from_master_xprv(secp, master, account, address_types)
+    }
+
+    /// Create a recipient side from a master extended private key. Not supplying a master key here
+    /// produces an error.
+    pub fn from_master_xprv<C: secp256k1::Signing>(
+        secp: &Secp256k1<C>,
+        master: bip32::ExtendedPrivKey,
+        account: u32,
+        address_types: HashSet<AddressType>,
+    ) -> Result<Self, Error> {
+        if master.depth == 0 && master.parent_fingerprint == bip32::Fingerprint::default() {
+            let path: bip32::DerivationPath = vec![
+                PURPOSE,
+                bip32::ChildNumber::Hardened { index: 0 },
+                bip32::ChildNumber::Hardened { index: account },
+            ]
+            .into();
+            let p = master.derive_priv(secp, &path)?.to_priv();
+
+            Ok(Self {
+                p,
+                P: PublicKey::from_private_key(secp, &p),
+                network: master.network,
+                address_types,
+            })
+        } else {
+            Err(Error::NotMasterKey)
+        }
     }
 
     /// Processes a scriptpubkey and tries to find a notification in it. If the notification
@@ -217,6 +248,23 @@ impl Recipient {
         }
 
         let data = &script.as_bytes().get(2..)?;
+
+        self.detect_notification_in_slice(secp, data)
+    }
+
+    /// Processes a byte slice and tries to find a notification in it. If the notification
+    /// isn't meant for this recipient, `None` is returned. Otherwise, the sender's public key,
+    /// along with the sender's chosen address type, is returned. Note that this has a 1 in ~4.3
+    /// billion chance of detecting a spurious notification.
+    pub fn detect_notification_in_slice(
+        &self,
+        secp: &secp256k1::Secp256k1<secp256k1::All>,
+        data: &[u8],
+    ) -> Option<RecipientCommitment> {
+        if data.get(0..2)? != NOTIFICATION_PREFIX {
+            return None;
+        }
+
         let notification_code = data.get(2..6)?;
         let sender_key = data.get(6..6 + 33)?;
         let address_type = AddressType::values()
@@ -391,7 +439,7 @@ fn network_to_hrp(network: &Network) -> &str {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum Error {
     /// The address type is not supported by the payment code.
     UnsupportedAddressType(AddressType),
@@ -405,6 +453,8 @@ pub enum Error {
     InvalidKey(bitcoin::util::key::Error),
     /// Curve operation error.
     Ecc(secp256k1::Error),
+    /// The key is not a master key where a master key is expected.
+    NotMasterKey,
 }
 
 impl From<bip32::Error> for Error {
@@ -532,6 +582,48 @@ mod tests {
                 .unwrap();
 
         assert_eq!(code, parsed);
+    }
+
+    #[test]
+    fn constructor_checks() {
+        {
+            let sender_from_seed = sender();
+
+            let sender_from_xprv =
+                Sender::from_master_xprv(&Secp256k1::new(), "xprv9s21ZrQH143K2qVytoy3eZSSuc1gfzFrkV4bgoHzYTkgge4UoNP62eV8jkHYNqddaaefpnjwkz71P5m4EW6RuQBJeP9pdfa9WBnjP6XUivG".parse().unwrap(), 0).unwrap();
+
+            assert_eq!(sender_from_seed, sender_from_xprv);
+
+            let sender_not_master =
+                Sender::from_master_xprv(&Secp256k1::new(), sender_from_seed.0, 0);
+
+            assert_eq!(sender_not_master, Err(Error::NotMasterKey));
+        }
+
+        {
+            let recipient_from_seed = recipient();
+
+            let recipient_from_xprv = Recipient::from_master_xprv(
+                &Secp256k1::new(),
+                "xprv9s21ZrQH143K47bRNtc26e8Gb3wkUiJ4fH3ewYgJeiGABp7vQtTKsLBzHM2fsfiK7Er6uMrWbdDwwrdcVn5TDC1T1npTFFkdEVoMgTwfVuR".parse().unwrap(),
+                0,
+                [AddressType::P2pkh, AddressType::P2wpkh]
+                    .into_iter()
+                    .collect(),
+            )
+            .unwrap();
+
+            assert_eq!(recipient_from_seed, recipient_from_xprv);
+
+            let recipient_not_master = Recipient::from_master_xprv(
+                &Secp256k1::new(),
+                sender().0,
+                0,
+                recipient_from_xprv.address_types.clone(),
+            );
+
+            assert_eq!(recipient_not_master, Err(Error::NotMasterKey));
+        }
     }
 
     fn sender() -> Sender {
