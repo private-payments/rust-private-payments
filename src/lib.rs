@@ -73,12 +73,7 @@ impl Sender {
         account: u32,
     ) -> Result<Self, Error> {
         if master.depth == 0 && master.parent_fingerprint == bip32::Fingerprint::default() {
-            let path: bip32::DerivationPath = vec![
-                PURPOSE,
-                bip32::ChildNumber::Hardened { index: 0 },
-                bip32::ChildNumber::Hardened { index: account },
-            ]
-            .into();
+            let path = path(master.network, account);
             let n = master.derive_priv(secp, &path)?;
 
             Ok(Self(n))
@@ -215,12 +210,7 @@ impl Recipient {
         address_types: HashSet<AddressType>,
     ) -> Result<Self, Error> {
         if master.depth == 0 && master.parent_fingerprint == bip32::Fingerprint::default() {
-            let path: bip32::DerivationPath = vec![
-                PURPOSE,
-                bip32::ChildNumber::Hardened { index: 0 },
-                bip32::ChildNumber::Hardened { index: account },
-            ]
-            .into();
+            let path = path(master.network, account);
             let p = master.derive_priv(secp, &path)?.to_priv();
 
             Ok(Self {
@@ -437,6 +427,21 @@ fn network_to_hrp(network: &Network) -> &str {
         Network::Bitcoin => "pay",
         _ => "payt",
     }
+}
+
+/// Compute a BIP351 derivation path from master given a network and account.
+fn path(network: Network, account: u32) -> bip32::DerivationPath {
+    vec![
+        PURPOSE,
+        bip32::ChildNumber::Hardened {
+            index: match network {
+                Network::Bitcoin => 0,
+                _ => 1,
+            },
+        },
+        bip32::ChildNumber::Hardened { index: account },
+    ]
+    .into()
 }
 
 #[derive(Debug, PartialEq, Eq)]
